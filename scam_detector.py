@@ -3,35 +3,45 @@ import re
 import jieba
 import json
 import numpy as np
+from typing import List, Tuple, Dict
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import pickle
 from datetime import datetime
+
 from config import db_config
 
 
 class ScamDetector:
     """詐騙 / 行銷 / 正常 訊息偵測器"""
 
+    # 0=normal, 1=marketing, 2=scam
     LABEL_MAP = {
         0: "normal",
         1: "marketing",
         2: "scam",
     }
 
-    def __init__(self, db_config):
+    def __init__(self, db_config: dict):
         self.db_config = db_config
-        self.vectorizer = TfidfVectorizer(max_features=2000, ngram_range=(1, 2))
+
+        self.vectorizer = TfidfVectorizer(
+            max_features=2000,
+            ngram_range=(1, 2),
+        )
         self.classifier = RandomForestClassifier(
             n_estimators=200,
             random_state=42,
         )
         self.is_trained = False
 
+        # 詐騙關鍵字
         self.scam_keywords = [
             "匯款",
             "轉帳",
@@ -70,17 +80,25 @@ class ScamDetector:
             "輸入密碼",
         ]
 
+        # 可疑模式
         self.suspicious_patterns = [
-            r"\d{10,}",
-            r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+",
+            r"\d{10,}",  # 長數字串（帳號、電話）
+            r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|"
+            r"(?:%[0-9a-fA-F][0-9a-fA-F]))+",
             r"\$\d+|\d+元",
             r"line|LINE|賴",
         ]
+
+    # ===== DB 相關 =====
 
     def connect_db(self):
         return psycopg2.connect(**self.db_config)
 
     def create_tables(self):
+        """
+        確保 messages / predictions 表存在，並加上 label_id 欄位
+        （不動你 training_data、model_history，那些在 train.py 裡）
+        """
         conn = self.connect_db()
         cursor = conn.cursor()
 
@@ -88,9 +106,9 @@ class ScamDetector:
             """
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
-                content   TEXT      NOT NULL,
-                is_scam   BOOLEAN,
-                label_id  INTEGER,
+                content TEXT NOT NULL,
+                is_scam BOOLEAN,
+                label_id INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -101,27 +119,20 @@ class ScamDetector:
             """
             CREATE TABLE IF NOT EXISTS predictions (
                 id SERIAL PRIMARY KEY,
-                message_id       INTEGER REFERENCES messages(id),
+                message_id INTEGER REFERENCES messages(id),
                 scam_probability FLOAT,
-                predicted_label  BOOLEAN,
-                label_id         INTEGER,
-                features         JSONB,
-                predicted_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                predicted_label BOOLEAN,
+                label_id INTEGER,
+                features JSONB,
+                predicted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
 
         cursor.execute(
-            "ALTER TABLE messages    ADD COLUMN IF NOT EXISTS label_id INTEGER"
-        )
-        cursor.execute(
-            "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS label_id INTEGER"
-        )
-
-        cursor.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_messages_is_scam       ON messages(is_scam);
-            CREATE INDEX IF NOT EXISTS idx_messages_label_id      ON messages(label_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_is_scam ON messages(is_scam);
+            CREATE INDEX IF NOT EXISTS idx_messages_label_id ON messages(label_id);
             CREATE INDEX IF NOT EXISTS idx_predictions_message_id ON predictions(message_id);
             """
         )
@@ -129,7 +140,9 @@ class ScamDetector:
         conn.commit()
         cursor.close()
         conn.close()
-        print("✓ 資料表創建/更新完成")
+        print("✓ ScamDetector 資料表創建/更新完成")
+
+    # ===== 文本處理 / 特徵 =====
 
     def preprocess_text(self, text: str) -> str:
         text = text.lower()
@@ -137,8 +150,9 @@ class ScamDetector:
         words = jieba.cut(text)
         return " ".join(words)
 
-    def extract_features(self, text: str) -> dict:
-        features = {}
+    def extract_features(self, text: str) -> Dict[str, object]:
+        features: Dict[str, object] = {}
+
         keyword_count = sum(1 for keyword in self.scam_keywords if keyword in text)
         features["keyword_count"] = keyword_count
         features["has_keywords"] = keyword_count > 0
@@ -157,7 +171,14 @@ class ScamDetector:
 
         return features
 
-    def load_training_data(self):
+    # ===== 載入訓練資料（從 messages）=====
+
+    def load_training_data(self) -> Tuple[List[str], List[int]]:
+        """
+        從 messages 表載入訓練資料：
+        - 有 label_id 就用 label_id
+        - 沒 label_id 就用 is_scam 推出 0/2
+        """
         conn = self.connect_db()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -176,22 +197,29 @@ class ScamDetector:
             """
         )
 
-        data = cursor.fetchall()
+        rows = cursor.fetchall()
         cursor.close()
         conn.close()
 
-        data = [row for row in data if row["label_id"] is not None]
+        rows = [r for r in rows if r["label_id"] is not None]
 
-        if not data:
+        if not rows:
             raise ValueError("資料庫中沒有可用的訓練資料")
 
-        texts = [row["content"] for row in data]
-        labels = [int(row["label_id"]) for row in data]
+        texts = [r["content"] for r in rows]
+        labels = [int(r["label_id"]) for r in rows]
 
         return texts, labels
 
+    # ===== 訓練 =====
+
     def train(self):
-        print("正在載入訓練資料（messages）...")
+        """
+        給 train.py 用：
+        - train.py 先把 training_data sync 到 messages（包含 is_scam）
+        - 然後呼叫 detector.train()
+        """
+        print("正在從 messages 載入訓練資料...")
         texts, labels = self.load_training_data()
 
         total = len(labels)
@@ -204,9 +232,15 @@ class ScamDetector:
         print(f"  行銷(1): {marketing}")
         print(f"  詐騙(2): {scam}")
 
-        self.train_from_lists(texts, labels)
+        self._train_from_lists(texts, labels)
 
-    def train_from_lists(self, texts, labels):
+    def train_from_lists(self, texts: List[str], labels: List[int]):
+        """
+        給你如果將來要直接從 CSV / 程式碼丟 list 來訓練也可以用這個。
+        """
+        self._train_from_lists(texts, labels)
+
+    def _train_from_lists(self, texts: List[str], labels: List[int]):
         print("正在處理文本...")
         processed_texts = [self.preprocess_text(t) for t in texts]
 
@@ -231,27 +265,21 @@ class ScamDetector:
 
         X_combined = np.hstack([X_tfidf.toarray(), np.array(extra_features)])
 
-        unique_labels, counts = np.unique(labels, return_counts=True)
-        if len(unique_labels) > 1 and min(counts) >= 2:
-            stratify = labels
-        else:
-            stratify = None
-
         X_train, X_test, y_train, y_test = train_test_split(
             X_combined,
             labels,
             test_size=0.2,
             random_state=42,
-            stratify=stratify,
+            stratify=labels,
         )
 
-        print("正在訓練多分類模型 (0/1/2)...")
+        print("正在訓練多分類模型 (0=normal / 1=marketing / 2=scam)...")
         self.classifier.fit(X_train, y_train)
 
         y_pred = self.classifier.predict(X_test)
 
-        used_labels = sorted(set(labels))
-        target_names = [self.LABEL_MAP.get(l, str(l)) for l in used_labels]
+        unique_labels = sorted(set(labels))
+        target_names = [self.LABEL_MAP.get(l, str(l)) for l in unique_labels]
 
         print("\n模型評估結果:")
         print(classification_report(y_test, y_pred, target_names=target_names))
@@ -261,7 +289,9 @@ class ScamDetector:
         self.is_trained = True
         print("\n✓ 模型訓練完成")
 
-    def predict(self, text, save_to_db=True):
+    # ===== 預測 =====
+
+    def predict(self, text: str, save_to_db: bool = True) -> dict:
         if not self.is_trained:
             raise ValueError("模型尚未訓練，請先執行 train() 或 load_model()")
 
@@ -288,7 +318,16 @@ class ScamDetector:
 
         pred_label = int(self.classifier.predict(X_combined)[0])
 
-        proba_map = {}
+        # ===== TF-IDF 權重（給前端看用）=====
+        feature_names = self.vectorizer.get_feature_names_out()
+        tfidf_vector = X_tfidf.toarray()[0]
+        tfidf_features = {
+            feature_names[i]: float(tfidf_vector[i])
+            for i in range(len(feature_names))
+            if tfidf_vector[i] > 0
+        }
+
+        proba_map: Dict[str, float] = {}
         scam_prob = 0.0
         confidence = 0.0
 
@@ -304,8 +343,7 @@ class ScamDetector:
                     confidence = p
                 if cls == 2:
                     scam_prob = p
-
-        if not proba_map:
+        else:
             name = self.LABEL_MAP.get(pred_label, "unknown")
             proba_map[name] = 1.0
             confidence = 1.0
@@ -319,13 +357,14 @@ class ScamDetector:
         is_scam = pred_label == 2
 
         result = {
-            "is_scam": is_scam,
-            "scam_probability": scam_prob,
+            "is_scam": is_scam,                  # 相容舊 API
+            "scam_probability": scam_prob,       # 類別 2 的機率
             "label": label_text,
             "label_id": pred_label,
-            "probabilities": proba_map,
+            "probabilities": proba_map,          # normal / marketing / scam
             "confidence": confidence,
-            "features": f,
+            "features": f,                       # 手工特徵
+            "tfidf_features": tfidf_features,    # TF-IDF 權重
             "warning_level": warning_level,
         }
 
@@ -334,7 +373,7 @@ class ScamDetector:
 
         return result
 
-    def _get_warning_level(self, label_id, confidence):
+    def _get_warning_level(self, label_id: int, confidence: float) -> str:
         if label_id == 2:
             if confidence >= 0.85:
                 return "高危險"
@@ -344,13 +383,15 @@ class ScamDetector:
                 return "低度風險"
             else:
                 return "需留意"
-        if label_id == 1:
+        elif label_id == 1:
             return "行銷資訊"
-        if confidence >= 0.7:
-            return "安全"
-        return "大致安全"
+        else:
+            if confidence >= 0.7:
+                return "安全"
+            else:
+                return "大致安全"
 
-    def _save_prediction(self, text, result):
+    def _save_prediction(self, text: str, result: dict):
         conn = self.connect_db()
         cursor = conn.cursor()
 
@@ -383,7 +424,9 @@ class ScamDetector:
         cursor.close()
         conn.close()
 
-    def save_model(self, filename="scam_detector_model.pkl"):
+    # ===== 模型儲存 / 載入 =====
+
+    def save_model(self, filename: str = "scam_detector_model.pkl"):
         if not self.is_trained:
             raise ValueError("模型尚未訓練")
 
@@ -399,7 +442,7 @@ class ScamDetector:
 
         print(f"✓ 模型已儲存至 {filename}")
 
-    def load_model(self, filename="scam_detector_model.pkl"):
+    def load_model(self, filename: str = "scam_detector_model.pkl"):
         with open(filename, "rb") as f:
             model_data = pickle.load(f)
 

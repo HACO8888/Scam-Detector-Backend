@@ -1,19 +1,18 @@
 import os
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Dict
 
+from authlib.integrations.starlette_client import OAuth
+from dotenv import load_dotenv
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.sessions import SessionMiddleware
 from fastapi.templating import Jinja2Templates
-
-from authlib.integrations.starlette_client import OAuth
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from dotenv import load_dotenv
+from starlette.middleware.sessions import SessionMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 
 from .database import get_db
 from .models import User
@@ -22,23 +21,13 @@ from config import db_config
 
 load_dotenv()
 
-
-# -------------------------------------------------
-# JWT CONFIG
-# -------------------------------------------------
-
 SECRET_KEY = os.getenv("SECRET_KEY", "CHANGE_ME")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 120
-
-
-# -------------------------------------------------
-# FASTAPI 初始化
-# -------------------------------------------------
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 app = FastAPI(
     title="Scam Detector API",
-    description="詐騙偵測系統（Google 登入 + JWT + 使用者管理 + 三分類模型）",
+    description="詐騙偵測 API（Google 登入 + JWT + User 管理 + 三分類模型）",
     version="3.0.0",
 )
 
@@ -62,11 +51,6 @@ app.add_middleware(
 
 templates = Jinja2Templates(directory="API/templates")
 
-
-# -------------------------------------------------
-# GOOGLE OAUTH
-# -------------------------------------------------
-
 oauth = OAuth()
 oauth.register(
     name="google",
@@ -74,197 +58,24 @@ oauth.register(
     client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
     server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
     client_kwargs={"scope": "openid email profile"},
+    api_base_url="https://openidconnect.googleapis.com/v1/",
 )
-
-
-# -------------------------------------------------
-# GLOBAL MODEL
-# -------------------------------------------------
 
 detector: Optional[ScamDetector] = None
 
 
-@app.on_event("startup")
-def load_model():
-    global detector
-    detector = ScamDetector(db_config)
-    detector.create_tables()
-    detector.load_model("scam_detector_model.pkl")
-    print("✓ 模型已載入")
-
-
-# -------------------------------------------------
-# JWT 功能
-# -------------------------------------------------
+# ====== Pydantic Schemas ======
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=30))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+class TokenData(BaseModel):
+    user_id: int
+    email: str
+    is_admin: bool
 
-
-def verify_password(raw: str, hashed: str) -> bool:
-    return raw == hashed
-
-
-def hash_password(raw: str) -> str:
-    return raw
-
-
-def get_current_user_from_token(token: str, db: Session) -> User:
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("user_id")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Token 無效")
-
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user or not user.is_active:
-            raise HTTPException(status_code=401, detail="使用者不存在或已停用")
-
-        return user
-
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Token 解析錯誤")
-
-
-async def get_current_user(
-    request: Request,
-    db: Session = Depends(get_db),
-    access_token_cookie: Optional[str] = Cookie(default=None, alias="access_token"),
-) -> User:
-
-    auth_header = request.headers.get("Authorization")
-    token = None
-
-    if auth_header and auth_header.lower().startswith("bearer "):
-        token = auth_header.split(" ")[1]
-    elif access_token_cookie:
-        token = access_token_cookie
-
-    if not token:
-        raise HTTPException(status_code=401, detail="未登入")
-
-    return get_current_user_from_token(token, db)
-
-
-async def get_current_admin(user: User = Depends(get_current_user)) -> User:
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="需要管理員權限")
-    return user
-
-
-# -------------------------------------------------
-# AUTH: 帳密登入
-# -------------------------------------------------
-
-@app.post("/auth/token", response_model=Token, summary="帳密登入取得 JWT")
-async def login_with_password(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db),
-):
-    user = db.query(User).filter(User.email == form_data.username).first()
-
-    if not user or not user.is_active:
-        raise HTTPException(status_code=401, detail="帳號不存在或停用")
-
-    if not verify_password(form_data.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="密碼錯誤")
-
-    token = create_access_token(
-        {"user_id": user.id, "email": user.email, "is_admin": user.is_admin},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
-    )
-
-    return Token(access_token=token, token_type="bearer")
-
-
-# -------------------------------------------------
-# GOOGLE LOGIN
-# -------------------------------------------------
-
-@app.get("/auth/google/login")
-async def google_login(request: Request):
-    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
-    return await oauth.google.authorize_redirect(request, redirect_uri)
-
-
-@app.get("/auth/google/callback")
-async def google_callback(
-    request: Request,
-    db: Session = Depends(get_db),
-):
-    token = await oauth.google.authorize_access_token(request)
-    userinfo = (await oauth.google.get("userinfo", token=token)).json()
-
-    email = userinfo.get("email")
-    sub = userinfo.get("sub")
-    full_name = userinfo.get("name")
-
-    if not email:
-        raise HTTPException(status_code=400, detail="無法取得 email")
-
-    user = db.query(User).filter(User.email == email).first()
-
-    # 第一次登入自動成為 admin
-    make_admin = (db.query(User).count() == 0)
-
-    if not user:
-        user = User(
-            email=email,
-            google_id=sub,
-            full_name=full_name,
-            is_active=True,
-            is_admin=make_admin,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-            last_login_at=datetime.utcnow(),
-        )
-        db.add(user)
-    else:
-        user.last_login_at = datetime.utcnow()
-        if make_admin:
-            user.is_admin = True
-
-    db.commit()
-    db.refresh(user)
-
-    # 產生 JWT
-    jwt_token = create_access_token(
-        {"user_id": user.id, "email": user.email, "is_admin": user.is_admin},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
-    )
-
-    resp = RedirectResponse(url="/admin")
-    resp.set_cookie("access_token", jwt_token, httponly=True, max_age=7200)
-
-    return resp
-
-
-# -------------------------------------------------
-# 後台頁面
-# -------------------------------------------------
-
-@app.get("/admin", response_class=HTMLResponse)
-async def admin_page(
-    request: Request,
-    user: User = Depends(get_current_admin),
-):
-    return templates.TemplateResponse(
-        "admin.html",
-        {"request": request, "user_email": user.email},
-    )
-
-
-# -------------------------------------------------
-# 使用者 CRUD
-# -------------------------------------------------
 
 class UserBase(BaseModel):
     email: str
@@ -291,23 +102,251 @@ class UserOut(UserBase):
         orm_mode = True
 
 
-@app.get("/users", summary="列出所有使用者", response_model=List[UserOut])
+class PredictRequest(BaseModel):
+    message: str
+    save_to_db: bool = True
+
+
+class BatchPredictRequest(BaseModel):
+    messages: List[str]
+    save_to_db: bool = True
+
+
+class PredictResult(BaseModel):
+    is_scam: bool
+    scam_probability: float
+    confidence: float
+    warning_level: str
+    label: str
+    label_id: int
+    probabilities: Dict[str, float]
+    features: dict
+    tfidf_features: Optional[Dict[str, float]] = None
+    message: str
+
+
+class BatchPredictResult(BaseModel):
+    results: List[PredictResult]
+
+
+# ====== Auth helpers ======
+
+def hash_password(raw: str) -> str:
+    return raw
+
+
+def verify_password(raw: str, hashed: str) -> bool:
+    return raw == hashed
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_current_user_from_token(token: str, db: Session) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="無法驗證憑證",
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("user_id")
+        email = payload.get("email")
+        is_admin = payload.get("is_admin")
+        if user_id is None or email is None:
+            raise credentials_exception
+        TokenData(user_id=user_id, email=email, is_admin=is_admin)
+    except JWTError:
+        raise credentials_exception
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.is_active:
+        raise credentials_exception
+    return user
+
+
+async def get_current_user(
+    request: Request,
+    db: Session = Depends(get_db),
+    access_token_cookie: Optional[str] = Cookie(default=None, alias="access_token"),
+) -> User:
+    auth_header = request.headers.get("Authorization")
+    token = None
+    if auth_header and auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1]
+    elif access_token_cookie:
+        token = access_token_cookie
+    if not token:
+        raise HTTPException(status_code=401, detail="未登入")
+    return get_current_user_from_token(token, db)
+
+
+async def get_current_admin(user: User = Depends(get_current_user)) -> User:
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="需要管理員權限")
+    return user
+
+
+# ====== Startup ======
+
+@app.on_event("startup")
+def startup_event() -> None:
+    global detector
+    detector = ScamDetector(db_config)
+    detector.create_tables()
+    model_path = "scam_detector_model.pkl"
+    if os.path.exists(model_path):
+        detector.load_model(model_path)
+    else:
+        print(f"⚠️ 找不到模型檔 {model_path}，請先跑 train.py")
+
+
+# ====== Health ======
+
+@app.get("/health")
+async def health_check() -> dict:
+    return {
+        "status": "ok",
+        "detector_loaded": detector is not None and detector.is_trained,
+        "version": "3-class",
+    }
+
+
+# ====== Auth endpoints ======
+
+@app.post("/auth/token", response_model=Token, summary="帳密登入取得 JWT")
+async def login_with_password(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+) -> Token:
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="帳號不存在或已停用")
+    if not user.password_hash or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="密碼錯誤")
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = create_access_token(
+        {
+            "user_id": user.id,
+            "email": user.email,
+            "is_admin": user.is_admin,
+        },
+        expires_delta=access_token_expires,
+    )
+    return Token(access_token=token, token_type="bearer")
+
+
+@app.get("/auth/google/login", summary="Google 登入")
+async def google_login(request: Request):
+    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI") or str(
+        request.url_for("google_callback")
+    )
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+
+@app.get("/auth/google/callback", summary="Google 登入 Callback")
+async def google_callback(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    token = await oauth.google.authorize_access_token(request)
+    resp = await oauth.google.get("userinfo", token=token)
+    userinfo = resp.json()
+
+    email = userinfo.get("email")
+    sub = userinfo.get("sub")
+    full_name = userinfo.get("name")
+
+    if not email:
+        raise HTTPException(status_code=400, detail="無法取得 email")
+
+    initial_admin_email = os.getenv("INITIAL_ADMIN_EMAIL")
+
+    total_users = db.query(User).count()
+    is_first_user = total_users == 0
+    make_admin = bool(initial_admin_email and email == initial_admin_email) or is_first_user
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        user = User(
+            email=email,
+            google_id=sub,
+            full_name=full_name,
+            is_active=True,
+            is_admin=make_admin,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+            last_login_at=datetime.utcnow(),
+        )
+        db.add(user)
+    else:
+        user.google_id = user.google_id or sub
+        user.last_login_at = datetime.utcnow()
+        if make_admin and not user.is_admin:
+            user.is_admin = True
+
+    db.commit()
+    db.refresh(user)
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    jwt_token = create_access_token(
+        {
+            "user_id": user.id,
+            "email": user.email,
+            "is_admin": user.is_admin,
+        },
+        expires_delta=access_token_expires,
+    )
+
+    response = RedirectResponse(url="/admin")
+    response.set_cookie(
+        "access_token",
+        jwt_token,
+        httponly=True,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )
+    return response
+
+
+# ====== Admin pages ======
+
+@app.get("/admin", response_class=HTMLResponse, summary="後台管理頁")
+async def admin_page(
+    request: Request,
+    user: User = Depends(get_current_admin),
+):
+    return templates.TemplateResponse(
+        "admin.html",
+        {
+            "request": request,
+            "user_email": user.email,
+            "user_is_admin": user.is_admin,
+        },
+    )
+
+
+# ====== User CRUD ======
+
+@app.get("/users", response_model=List[UserOut], summary="列出所有使用者")
 async def list_users(
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_admin),
-):
-    return db.query(User).order_by(User.id).all()
+) -> List[UserOut]:
+    users = db.query(User).order_by(User.id).all()
+    return users
 
 
-@app.post("/users", summary="新增使用者", response_model=UserOut)
+@app.post("/users", response_model=UserOut, summary="新增使用者")
 async def create_user(
     body: UserCreate,
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_admin),
-):
-    if db.query(User).filter(User.email == body.email).first():
+) -> UserOut:
+    existing = db.query(User).filter(User.email == body.email).first()
+    if existing:
         raise HTTPException(status_code=400, detail="Email 已存在")
-
     user = User(
         email=body.email,
         full_name=body.full_name,
@@ -317,22 +356,32 @@ async def create_user(
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
     )
-
     db.add(user)
     db.commit()
     db.refresh(user)
     return user
 
 
-@app.put("/users/{user_id}", summary="更新使用者", response_model=UserOut)
+@app.get("/users/{user_id}", response_model=UserOut, summary="取得使用者資料")
+async def get_user_detail(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+) -> UserOut:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="使用者不存在")
+    return user
+
+
+@app.put("/users/{user_id}", response_model=UserOut, summary="更新使用者")
 async def update_user(
     user_id: int,
     body: UserUpdate,
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_admin),
-):
+) -> UserOut:
     user = db.query(User).filter(User.id == user_id).first()
-
     if not user:
         raise HTTPException(status_code=404, detail="使用者不存在")
 
@@ -351,7 +400,7 @@ async def update_user(
     return user
 
 
-@app.delete("/users/{user_id}")
+@app.delete("/users/{user_id}", summary="刪除使用者")
 async def delete_user(
     user_id: int,
     db: Session = Depends(get_db),
@@ -360,92 +409,68 @@ async def delete_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="使用者不存在")
-
     db.delete(user)
     db.commit()
-    return {"detail": "已刪除"}
+    return JSONResponse({"detail": "已刪除"})
 
 
-# -------------------------------------------------
-# PREDICT API
-# -------------------------------------------------
+# ====== Predict endpoints ======
 
-class PredictRequest(BaseModel):
-    message: str
-    save_to_db: bool = True
-
-
-class PredictResult(BaseModel):
-    is_scam: bool
-    scam_probability: float
-    confidence: float
-    warning_level: str
-    features: dict
-    message: str
-
-
-@app.post("/predict", summary="單筆偵測", response_model=PredictResult)
+@app.post("/predict", response_model=PredictResult, summary="單筆訊息偵測（多分類）")
 async def predict_single(
     body: PredictRequest,
-    user: User = Depends(get_current_user),
-):
-    if detector is None:
-        raise HTTPException(status_code=500, detail="模型未初始化")
+    current_user: User = Depends(get_current_user),
+) -> PredictResult:
+    if detector is None or not detector.is_trained:
+        raise HTTPException(status_code=500, detail="模型尚未初始化")
 
-    result = detector.predict(body.message, save_to_db=body.save_to_db)
-
-    return PredictResult(
-        is_scam=result["is_scam"],
-        scam_probability=result["scam_probability"],
-        confidence=result["confidence"],
-        warning_level=result["warning_level"],
-        features=result["features"],
-        message=body.message,
-    )
-
-
-# -------------------------------------------------
-# 批次偵測
-# -------------------------------------------------
-
-class BatchPredictRequest(BaseModel):
-    messages: List[str]
-    save_to_db: bool = True
+    try:
+        r = detector.predict(body.message, save_to_db=body.save_to_db)
+        return PredictResult(
+            is_scam=r["is_scam"],
+            scam_probability=r["scam_probability"],
+            confidence=r["confidence"],
+            warning_level=r["warning_level"],
+            label=r["label"],
+            label_id=r["label_id"],
+            probabilities=r["probabilities"],
+            features=r["features"],
+            tfidf_features=r.get("tfidf_features"),
+            message=body.message,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"預測失敗: {e}")
 
 
-class BatchPredictResult(BaseModel):
-    results: List[PredictResult]
-
-
-@app.post("/predict/batch", summary="批次偵測", response_model=BatchPredictResult)
+@app.post("/predict/batch", response_model=BatchPredictResult, summary="多筆訊息批次偵測（多分類）")
 async def predict_batch(
     body: BatchPredictRequest,
-    user: User = Depends(get_current_user),
-):
-    if detector is None:
-        raise HTTPException(status_code=500, detail="模型未初始化")
+    current_user: User = Depends(get_current_user),
+) -> BatchPredictResult:
+    if detector is None or not detector.is_trained:
+        raise HTTPException(status_code=500, detail="模型尚未初始化")
+    if not body.messages:
+        raise HTTPException(status_code=400, detail="messages 不可為空")
 
-    output = []
-    for msg in body.messages:
-        r = detector.predict(msg, save_to_db=body.save_to_db)
-        output.append(
-            PredictResult(
-                is_scam=r["is_scam"],
-                scam_probability=r["scam_probability"],
-                confidence=r["confidence"],
-                warning_level=r["warning_level"],
-                features=r["features"],
-                message=msg,
+    results: List[PredictResult] = []
+    try:
+        for msg in body.messages:
+            r = detector.predict(msg, save_to_db=body.save_to_db)
+            results.append(
+                PredictResult(
+                    is_scam=r["is_scam"],
+                    scam_probability=r["scam_probability"],
+                    confidence=r["confidence"],
+                    warning_level=r["warning_level"],
+                    label=r["label"],
+                    label_id=r["label_id"],
+                    probabilities=r["probabilities"],
+                    features=r["features"],
+                    tfidf_features=r.get("tfidf_features"),
+                    message=msg,
+                )
             )
-        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"預測失敗: {e}")
 
-    return BatchPredictResult(results=output)
-
-
-# -------------------------------------------------
-# HEALTH CHECK
-# -------------------------------------------------
-
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "model_loaded": detector is not None}
+    return BatchPredictResult(results=results)
