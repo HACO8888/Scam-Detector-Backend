@@ -101,6 +101,9 @@ class UserOut(UserBase):
     class Config:
         orm_mode = True
 
+class PasswordChangeBody(BaseModel):
+    old_password: str
+    new_password: str
 
 class PredictRequest(BaseModel):
     message: str
@@ -240,6 +243,12 @@ async def login_with_password(
 
 @app.get("/auth/google/login", summary="Google 登入")
 async def google_login(request: Request):
+    # 讀取 ?next=/xxx
+    next_url = request.query_params.get("next")
+    if next_url:
+        # 存到 session，callback 再拿出來用
+        request.session["next_url"] = next_url
+
     redirect_uri = os.getenv("GOOGLE_REDIRECT_URI") or str(
         request.url_for("google_callback")
     )
@@ -267,28 +276,44 @@ async def google_callback(
     total_users = db.query(User).count()
     is_first_user = total_users == 0
     make_admin = bool(initial_admin_email and email == initial_admin_email) or is_first_user
-
+    
     user = db.query(User).filter(User.email == email).first()
+
     if not user:
-        user = User(
-            email=email,
-            google_id=sub,
-            full_name=full_name,
-            is_active=True,
-            is_admin=make_admin,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-            last_login_at=datetime.utcnow(),
+        raise HTTPException(
+            status_code=403,
+            detail="此 email 尚未在系統中註冊，請請管理員先建立帳號後再使用 Google 登入",
         )
-        db.add(user)
-    else:
-        user.google_id = user.google_id or sub
-        user.last_login_at = datetime.utcnow()
-        if make_admin and not user.is_admin:
-            user.is_admin = True
+
+    user.google_id = user.google_id or sub
+    user.last_login_at = datetime.utcnow()
+    if make_admin and not user.is_admin:
+        user.is_admin = True
 
     db.commit()
     db.refresh(user)
+
+    # user = db.query(User).filter(User.email == email).first()
+    # if not user:
+    #     user = User(
+    #         email=email,
+    #         google_id=sub,
+    #         full_name=full_name,
+    #         is_active=True,
+    #         is_admin=make_admin,
+    #         created_at=datetime.utcnow(),
+    #         updated_at=datetime.utcnow(),
+    #         last_login_at=datetime.utcnow(),
+    #     )
+    #     db.add(user)
+    # else:
+    #     user.google_id = user.google_id or sub
+    #     user.last_login_at = datetime.utcnow()
+    #     if make_admin and not user.is_admin:
+    #         user.is_admin = True
+
+    # db.commit()
+    # db.refresh(user)
 
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     jwt_token = create_access_token(
@@ -300,7 +325,15 @@ async def google_callback(
         expires_delta=access_token_expires,
     )
 
-    response = RedirectResponse(url="/admin")
+    next_url = request.session.pop("next_url", None)
+    frontend_base = os.getenv("FRONTEND_URL", "").rstrip("/")
+
+    if next_url and next_url.startswith("/"):
+        redirect_target = (frontend_base or "") + next_url
+    else:
+        redirect_target = frontend_base or "/"
+
+    response = RedirectResponse(url=redirect_target)
     response.set_cookie(
         "access_token",
         jwt_token,
@@ -308,6 +341,43 @@ async def google_callback(
         max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
     return response
+
+
+@app.post("/auth/change-password", summary="變更目前登入使用者的密碼")
+async def change_password(
+    body: PasswordChangeBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="使用者不存在")
+
+    if not user.password_hash:
+        # 例如純 Google 帳號、還沒設定密碼
+        raise HTTPException(status_code=400, detail="此帳號目前未設定密碼，請聯絡管理員")
+
+    if not verify_password(body.old_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="舊密碼錯誤")
+
+    user.password_hash = hash_password(body.new_password)
+    user.updated_at = datetime.utcnow()
+    db.commit()
+
+    return {"detail": "密碼已更新"}
+
+
+@app.get("/auth/me", summary="取得目前登入使用者資訊")
+async def get_me(
+    current_user: User = Depends(get_current_user),
+):
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "full_name": current_user.full_name,
+        "is_admin": current_user.is_admin,
+        "is_active": current_user.is_active,
+    }
 
 
 # ====== Admin pages ======
