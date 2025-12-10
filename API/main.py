@@ -4,7 +4,7 @@ from typing import List, Optional, Dict
 
 from authlib.integrations.starlette_client import OAuth
 from dotenv import load_dotenv
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, status
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, status, Response
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.templating import Jinja2Templates
@@ -367,17 +367,23 @@ async def change_password(
     return {"detail": "密碼已更新"}
 
 
-@app.get("/auth/me", summary="取得目前登入使用者資訊")
-async def get_me(
+@app.get("/auth/me", summary="取得目前登入使用者")
+async def auth_me(
     current_user: User = Depends(get_current_user),
 ):
     return {
         "id": current_user.id,
         "email": current_user.email,
-        "full_name": current_user.full_name,
         "is_admin": current_user.is_admin,
         "is_active": current_user.is_active,
     }
+
+
+@app.post("/auth/logout", summary="登出，清掉 access_token cookie")
+async def auth_logout(response: Response):
+    response = JSONResponse({"detail": "logged out"})
+    response.delete_cookie("access_token")
+    return response
 
 
 # ====== Admin pages ======
