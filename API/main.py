@@ -11,7 +11,9 @@ from fastapi.templating import Jinja2Templates
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from starlette.middleware.sessions import SessionMiddleware  # ← 新增這行
+from starlette.middleware.sessions import SessionMiddleware
+from fastapi.middleware.cors import CORSMiddleware
+
 
 from .database import get_db
 from .models import User
@@ -28,6 +30,19 @@ app = FastAPI(
     title="Scam Detector API",
     description="詐騙偵測 API（Google 登入 + JWT + User 管理）",
     version="2.0.0",
+)
+
+origins = [
+    "http://localhost:3000",
+    "https://scam.haco.tw",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True, 
+    allow_methods=["*"],
+    allow_headers=["*"], 
 )
 
 app.add_middleware(
