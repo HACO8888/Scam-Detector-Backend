@@ -99,7 +99,8 @@ class UserOut(UserBase):
     id: int
 
     class Config:
-        orm_mode = True
+        # orm_mode = True
+        from_attributes = True
 
 class PasswordChangeBody(BaseModel):
     old_password: str
@@ -359,6 +360,9 @@ async def change_password(
 
     if not verify_password(body.old_password, user.password_hash):
         raise HTTPException(status_code=400, detail="舊密碼錯誤")
+    
+    if user.email == "test@test":
+        raise HTTPException(status_code=403, detail="測試用戶不可變更密碼")
 
     user.password_hash = hash_password(body.new_password)
     user.updated_at = datetime.utcnow()
