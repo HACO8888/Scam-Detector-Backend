@@ -41,7 +41,7 @@ class ScamDetector:
         )
         self.is_trained = False
 
-        # 詐騙關鍵字
+        # 詐騙關鍵字（只保留「行為 / 威脅 / 金流」）
         self.scam_keywords = [
             "匯款",
             "轉帳",
@@ -50,11 +50,6 @@ class ScamDetector:
             "家人出事",
             "車禍",
             "住院",
-            "中獎",
-            "恭喜",
-            "免費",
-            "限時",
-            "優惠",
             "投資",
             "穩賺",
             "高報酬",
@@ -62,22 +57,34 @@ class ScamDetector:
             "保證獲利",
             "解除分期",
             "誤設定",
-            "客服",
-            "系統升級",
             "帳戶異常",
             "身分驗證",
             "點擊連結",
             "重設密碼",
-            "領取",
-            "獎金",
-            "補助",
+            "補繳",
             "退稅",
             "包裹",
             "海關",
-            "未領取",
             "重新配送",
             "確認資料",
             "輸入密碼",
+        ]
+
+        # 行銷關鍵字（新）
+        self.marketing_keywords = [
+            "優惠",
+            "折扣",
+            "全館",
+            "買一送一",
+            "新品",
+            "會員",
+            "抽獎",
+            "訂閱",
+            "促銷",
+            "限時",
+            "專屬",
+            "滿額",
+            "購物金",
         ]
 
         # 可疑模式
@@ -169,6 +176,10 @@ class ScamDetector:
         features["exclamation_count"] = text.count("!")
         features["question_count"] = text.count("?")
 
+        marketing_count = sum(1 for k in self.marketing_keywords if k in text)
+        features["marketing_keyword_count"] = marketing_count
+        features["has_marketing_keywords"] = marketing_count > 0
+
         return features
 
     # ===== 載入訓練資料（從 messages）=====
@@ -208,7 +219,7 @@ class ScamDetector:
         - train.py 先把 training_data sync 到 messages（包含 is_scam）
         - 然後呼叫 detector.train()
         """
-        print("正在從 messages 載入訓練資料...")
+        print("正在從 training_data 載入訓練資料...")
         texts, labels = self.load_training_data()
 
         total = len(labels)
@@ -241,7 +252,8 @@ class ScamDetector:
             f = self.extract_features(t)
             extra_features.append(
                 [
-                    f["keyword_count"],
+                    f["keyword_count"],  # 詐騙關鍵字數
+                    f["marketing_keyword_count"],  # 行銷關鍵字數
                     f["pattern_count"],
                     f["text_length"],
                     int(f["has_url"]),
@@ -249,6 +261,7 @@ class ScamDetector:
                     int(f["has_money"]),
                     f["exclamation_count"],
                     f["question_count"],
+                    int(f["has_marketing_keywords"]),
                 ]
             )
 
@@ -292,6 +305,7 @@ class ScamDetector:
             [
                 [
                     f["keyword_count"],
+                    f["marketing_keyword_count"],
                     f["pattern_count"],
                     f["text_length"],
                     int(f["has_url"]),
@@ -299,6 +313,7 @@ class ScamDetector:
                     int(f["has_money"]),
                     f["exclamation_count"],
                     f["question_count"],
+                    int(f["has_marketing_keywords"]),
                 ]
             ]
         )
@@ -346,14 +361,14 @@ class ScamDetector:
         is_scam = pred_label == 2
 
         result = {
-            "is_scam": is_scam,                  # 相容舊 API
-            "scam_probability": scam_prob,       # 類別 2 的機率
+            "is_scam": is_scam,  # 相容舊 API
+            "scam_probability": scam_prob,  # 類別 2 的機率
             "label": label_text,
             "label_id": pred_label,
-            "probabilities": proba_map,          # normal / marketing / scam
+            "probabilities": proba_map,  # normal / marketing / scam
             "confidence": confidence,
-            "features": f,                       # 手工特徵
-            "tfidf_features": tfidf_features,    # TF-IDF 權重
+            "features": f,  # 手工特徵
+            "tfidf_features": tfidf_features,  # TF-IDF 權重
             "warning_level": warning_level,
         }
 

@@ -357,7 +357,15 @@ class DatabaseManager:
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
-            (version, training_samples, scam_samples, normal_samples, accuracy, model_path, notes),
+            (
+                version,
+                training_samples,
+                scam_samples,
+                normal_samples,
+                accuracy,
+                model_path,
+                notes,
+            ),
         )
 
         self.conn.commit()
@@ -401,7 +409,6 @@ class DatabaseManager:
         print("✓ 數據同步完成")
 
 
-
 # -------------------------------------------------
 # 模型訓練器
 # -------------------------------------------------
@@ -421,7 +428,7 @@ class ModelTrainer:
         print("=" * 60)
 
         # 1. 先把 training_data 同步到 messages
-        self.db_manager.sync_to_messages_table()
+        # self.db_manager.sync_to_messages_table()
 
         # 2. 交給 ScamDetector 自己從 messages 抓資料 & 訓練
         self.detector.train()
@@ -466,14 +473,12 @@ class ModelTrainer:
             ("緊急！家人出事需要手術費20萬", 2),
             ("投資比特幣，保證月收益35%，加 LINE: crypto888", 2),
             ("⚠️ 您的帳戶異常，請立即登入驗證以免停用", 2),
-
             # normal
             ("明天下午開會記得帶報告", 0),
             ("週末要去爬山嗎？", 0),
             ("今天天氣不錯", 0),
             ("下班後要一起吃飯嗎？", 0),
             ("我晚點會把檔案傳給你", 0),
-
             # marketing
             ("本週限時優惠，全館 5 折起！", 1),
             ("立即註冊會員，享受獨家折扣", 1),
@@ -503,7 +508,9 @@ class ModelTrainer:
                 correct += 1
 
             print("\n" + "-" * 60)
-            print(f"{mark} 期望：{expected_text} ({expected_label}) → 預測：{pred_text} ({pred_label})")
+            print(
+                f"{mark} 期望：{expected_text} ({expected_label}) → 預測：{pred_text} ({pred_label})"
+            )
             print(f"📨 訊息：{text}")
             print(f"📊 預測機率：{prob:.2%}")
             print(f"🔎 完整機率：{result['probabilities']}")
@@ -575,7 +582,11 @@ def interactive_mode(db_manager: DatabaseManager, trainer: ModelTrainer):
                 if db_manager.add_training_sample(
                     content, is_scam, source="manual", label_id=label_id
                 ):
-                    txt = "詐騙" if label_id == 2 else ("行銷" if label_id == 1 else "正常")
+                    txt = (
+                        "詐騙"
+                        if label_id == 2
+                        else ("行銷" if label_id == 1 else "正常")
+                    )
                     print(f"✓ 已添加: {txt} 訊息")
 
         elif choice == "3":
@@ -616,7 +627,9 @@ def main():
         """,
     )
 
-    parser.add_argument("--import", dest="import_file", metavar="CSV", help="從 CSV 檔案匯入訓練資料")
+    parser.add_argument(
+        "--import", dest="import_file", metavar="CSV", help="從 CSV 檔案匯入訓練資料"
+    )
     parser.add_argument("--train", action="store_true", help="從資料庫訓練模型")
     parser.add_argument("--test", action="store_true", help="測試現有模型")
     parser.add_argument("--all", metavar="CSV", help="匯入 CSV 並訓練（一鍵完成）")
