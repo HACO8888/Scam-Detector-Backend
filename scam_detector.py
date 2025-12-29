@@ -173,27 +173,20 @@ class ScamDetector:
 
     # ===== 載入訓練資料（從 messages）=====
 
-    def load_training_data(self) -> Tuple[List[str], List[int]]:
+    def load_training_data(self):
         """
-        從 messages 表載入訓練資料：
-        - 有 label_id 就用 label_id
-        - 沒 label_id 就用 is_scam 推出 0/2
+        僅從 training_data 載入訓練資料
+        label_id: 0=normal, 1=marketing, 2=scam
         """
         conn = self.connect_db()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
         cursor.execute(
             """
-            SELECT 
-                content,
-                CASE 
-                    WHEN label_id IS NOT NULL THEN label_id
-                    WHEN is_scam = TRUE THEN 2
-                    WHEN is_scam = FALSE THEN 0
-                    ELSE NULL
-                END AS label_id
-            FROM messages
-            WHERE (label_id IS NOT NULL) OR (is_scam IS NOT NULL)
+            SELECT content, label_id
+            FROM training_data
+            WHERE label_id IS NOT NULL
+            ORDER BY id
             """
         )
 
@@ -201,17 +194,13 @@ class ScamDetector:
         cursor.close()
         conn.close()
 
-        rows = [r for r in rows if r["label_id"] is not None]
-
         if not rows:
-            raise ValueError("資料庫中沒有可用的訓練資料")
+            raise ValueError("training_data 中沒有可用的訓練資料")
 
         texts = [r["content"] for r in rows]
         labels = [int(r["label_id"]) for r in rows]
 
         return texts, labels
-
-    # ===== 訓練 =====
 
     def train(self):
         """
